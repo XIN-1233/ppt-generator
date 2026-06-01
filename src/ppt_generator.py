@@ -664,10 +664,14 @@ def _tb(slide, x, y, w, h):
 
 
 def _font(paragraph, font_name, size, color_hex, bold=False, italic=False):
-    """Set font properties. Does NOT set font name to avoid missing-font warnings."""
+    """Set font properties. Tries to set font name; falls back silently if unavailable."""
     if not paragraph.runs:
         paragraph.add_run()
     r = paragraph.runs[0]
+    try:
+        r.font.name = font_name
+    except Exception:
+        pass
     r.font.size = size
     r.font.color.rgb = _hex(color_hex)
     r.font.bold = bold

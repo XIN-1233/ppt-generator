@@ -166,6 +166,7 @@ def validate_slide_structure(data: dict, expected_count: int) -> dict:
 
     # Ensure first slide is a title slide
     if slides[0].get("type") != "title":
+        print(f"WARNING: AI did not start with a title slide — inserting one")
         slides.insert(
             0,
             {
@@ -177,6 +178,7 @@ def validate_slide_structure(data: dict, expected_count: int) -> dict:
 
     # Ensure last slide is a summary slide (if we have enough slides)
     if len(slides) > 2 and slides[-1].get("type") != "summary":
+        print(f"WARNING: AI did not end with a summary slide — appending one")
         slides.append(
             {
                 "type": "summary",
@@ -191,6 +193,7 @@ def validate_slide_structure(data: dict, expected_count: int) -> dict:
 
     # Enforce slide count limit
     if len(slides) > expected_count + 2:
+        print(f"WARNING: AI returned {len(slides)} slides (expected {expected_count}) — trimming")
         # Keep the title slide, trim from the middle, keep the summary
         title_slide = slides[0]
         summary_slide = slides[-1] if slides[-1]["type"] == "summary" else None
@@ -198,6 +201,7 @@ def validate_slide_structure(data: dict, expected_count: int) -> dict:
         trimmed = body[: expected_count - (1 if summary_slide else 0)]
         slides = [title_slide] + trimmed + ([summary_slide] if summary_slide else [])
     elif len(slides) < expected_count:
+        print(f"WARNING: AI returned only {len(slides)} slides (expected {expected_count}) — padding")
         # Pad with placeholder content slides (should be rare with good prompts)
         while len(slides) < expected_count:
             slides.insert(

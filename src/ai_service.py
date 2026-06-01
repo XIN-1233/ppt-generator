@@ -7,6 +7,16 @@ from src.config import settings
 from src.models import PPTRequest
 from src.prompts import build_system_prompt, build_user_prompt
 
+# Fail fast if API key is missing (friendlier than a 500 timeout later)
+if not settings.anthropic_api_key:
+    raise RuntimeError(
+        "ANTHROPIC_AUTH_TOKEN is not set.\n"
+        "Create a .env file in the project root with your API key:\n"
+        "  cp .env.example .env\n"
+        "  # edit .env and add your ANTHROPIC_AUTH_TOKEN\n"
+        "Or set the environment variable directly."
+    )
+
 # Singleton client, reuse across requests
 client = anthropic.Anthropic(
     api_key=settings.anthropic_api_key,

@@ -522,13 +522,7 @@ def _highlight_card(slide, text, theme, fonts):
     )
     card.fill.solid()
     card.fill.fore_color.rgb = _hex(theme.accent_bar_color)
-    # Make it semi-transparent for a lighter look
     card.line.fill.background()
-    # Set transparency via alpha (50% opacity)
-    try:
-        card.fill.fore_color.brightness = 0.3  # Lighten effect
-    except Exception:
-        pass
 
     hb = _tb(slide, G["left"] + Inches(0.3), Inches(5.9), G["content_w"] - Inches(0.6), Inches(0.7))
     hb.text_frame.word_wrap = True
@@ -670,16 +664,10 @@ def _tb(slide, x, y, w, h):
 
 
 def _font(paragraph, font_name, size, color_hex, bold=False, italic=False):
-    """Set font on paragraph's first run. Skips font name to avoid missing-font issues."""
+    """Set font properties. Does NOT set font name to avoid missing-font warnings."""
     if not paragraph.runs:
         paragraph.add_run()
     r = paragraph.runs[0]
-    # Only set font name for non-default fonts that are likely system-available
-    if font_name in ("Calibri", "Arial", "Microsoft YaHei"):
-        try:
-            r.font.name = font_name
-        except Exception:
-            pass  # Use system default if font not found
     r.font.size = size
     r.font.color.rgb = _hex(color_hex)
     r.font.bold = bold

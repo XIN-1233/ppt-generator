@@ -1,55 +1,19 @@
-"""PPTX creation engine — unified grid system, consistent typography, polished layouts."""
+"""PPTX creation engine — safe layouts via built-in templates + text formatting."""
 
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.chart.data import CategoryChartData
-from pptx.oxml.ns import qn
 from io import BytesIO
 
 from src.templates import (
     THEMES, FONT_FAMILIES, SLIDE_WIDTH, SLIDE_HEIGHT,
 )
 from src.models import PPTRequest
-
-# ============================================================================
-# UNIFIED GRID SYSTEM (16:9 slide = 13.333" x 7.5")
-# ============================================================================
-G = {
-    "left": Inches(0.9),
-    "right_margin": Inches(0.5),
-    "content_w": Inches(11.9),
-    "top": Inches(1.25),
-    "bottom": Inches(7.05),
-    "accent_h": Inches(0.05),
-    "bottom_bar_h": Inches(0.02),
-    "num_x": Inches(12.4),
-    "num_y": Inches(7.1),
-}
-# Chart zones
-CHART_W = Inches(7.0)
-CHART_INSIGHT_GAP = Inches(0.35)
-INSIGHT_W = Inches(4.1)
-INSIGHT_X = G["left"] + CHART_W + CHART_INSIGHT_GAP
-
-# ============================================================================
-# TYPOGRAPHY HIERARCHY
-# ============================================================================
-F = {
-    "h1": Pt(40),       # Cover title
-    "h1_sub": Pt(20),   # Cover subtitle
-    "h2": Pt(28),       # Slide title
-    "h3": Pt(15),       # Slide subtitle / description
-    "body": Pt(16),     # Bullet text
-    "body_sm": Pt(14),  # Sub-bullet
-    "quote": Pt(26),    # Quote text
-    "big_num": Pt(80),  # Datapoint number
-    "light": Pt(22),    # Light slide text
-    "caption": Pt(8),   # Page number / labels
-}
+from src.image_service import get_picsum_bg, get_picsum_square
 
 
 # ============================================================================
@@ -57,50 +21,58 @@ F = {
 # ============================================================================
 def create_pptx(slide_data: dict, request: PPTRequest) -> BytesIO:
     theme = THEMES[request.style.value]
-    fonts = FONT_FAMILIES.get(request.language.value, FONT_FAMILIES["english"])
 
     prs = Presentation()
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
 
     slides = slide_data.get("slides", [])
+    for i, info in enumerate(slides):
+        st = info.get("type", "content")
+        depth = info.get("depth", "medium")
 
-    for i, slide_info in enumerate(slides):
-        st = slide_info.get("type", "content")
-        depth = slide_info.get("depth", "medium")
-
-        # Dispatch
         if st == "title":
-            _title(prs, slide_info, theme, fonts)
+            _title(prs, info, theme)
         elif st == "section":
-            _section(prs, slide_info, theme, fonts)
+            _section(prs, info, theme)
         elif st == "chart":
-            _chart(prs, slide_info, theme, fonts)
+            _chart(prs, info, theme)
         elif st == "two_column":
-            _two_col(prs, slide_info, theme, fonts)
+            _two_col(prs, info, theme)
         elif st == "quote":
-            _quote(prs, slide_info, theme, fonts)
-        elif st == "datapoint":
-            _datapoint(prs, slide_info, theme, fonts)
-        elif st == "agenda":
-            _agenda(prs, slide_info, theme, fonts)
-        elif depth == "light" or slide_info.get("content_style") == "narrative":
-            _light(prs, slide_info, theme, fonts)
-        elif depth == "deep":
-            _content(prs, slide_info, theme, fonts, deep=True)
+            _section(prs, info, theme)
+        elif st == "image_slide":
+            _image_slide(prs, info, theme)
+        elif st == "timeline":
+            _timeline(prs, info, theme)
+        elif st == "comparison":
+            _comparison(prs, info, theme)
+        elif st == "big_idea":
+            _big_idea(prs, info, theme)
         else:
-            _content(prs, slide_info, theme, fonts, deep=False)
+            _content(prs, info, theme, depth)
 
-        # Slide number (skip title)
-        if i > 0:
-            _page_num(prs.slides[-1], i, theme)
+        # Decorations — applied to every slide (safe shape-based only)
+        slide = prs.slides[-1]
 
-        # Speaker notes
-        _notes(prs.slides[-1], slide_info)
+        # Top accent bar (except title slide which has its own design)
+        if i > 0 and st not in ("image_slide", "big_idea"):
+            _top_bar(slide, theme)
+            _slide_num(slide, i, theme)
 
-        # Bottom bar on content-type slides
+        # Bottom line on content-type slides
         if st in ("content", "agenda", "summary", "chart", "two_column", "datapoint"):
-            _bottom_bar(prs.slides[-1], theme)
+            _bottom_bar(slide, theme)
+
+        # Section slides: left accent stripe
+        if st == "section":
+            _left_stripe(slide, theme)
+
+        # Slide progress indicator (skip title/section/big_idea)
+        if i > 0 and st not in ("section", "image_slide", "big_idea"):
+            _slide_progress(slide, i, len(slides), theme)
+
+        _notes(slide, info)
 
     buffer = BytesIO()
     prs.save(buffer)
@@ -109,488 +81,290 @@ def create_pptx(slide_data: dict, request: PPTRequest) -> BytesIO:
 
 
 # ============================================================================
+# FORMAT HELPERS  (safe — only manipulate paragraph runs)
+# ============================================================================
+
+def _hex(h: str) -> RGBColor:
+    """Convert hex string '1F4E79' to RGBColor."""
+    h = h.lstrip("#")
+    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _run(paragraph, text, size=None, color=None, bold=False, italic=False):
+    """Add a run with formatted text. Safe — no XML manipulation."""
+    run = paragraph.add_run()
+    run.text = text
+    if size:
+        run.font.size = size
+    if color:
+        run.font.color.rgb = _hex(color)
+    run.font.bold = bold
+    run.font.italic = italic
+    return run
+
+
+def _thin_line(slide, left, top, width, color_hex):
+    """Add a thin decorative line. Safe rectangle shape."""
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        Inches(left), Inches(top), Inches(width), Inches(0.015),
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _hex(color_hex)
+    shape.line.fill.background()
+
+
+# ============================================================================
 # SLIDE LAYOUTS
 # ============================================================================
 
-def _title(prs, info, theme, fonts):
-    """Cover slide — full-bleed color, centered title + subtitle, elegant lines."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    # Background
-    _rect(slide, 0, 0, 13.333, 7.5, theme.title_slide_bg)
+def _title(prs, info, theme):
+    """Title slide with accent line."""
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
 
-    # Top decorative line
-    _rect(slide, 3.5, 2.6, 6.333, 0.015, theme.accent_bar_color)
+    title = info.get("title", "Presentation")
+    subtitle = info.get("subtitle", "")
+
+    # Style title shape
+    if slide.shapes.title:
+        tf = slide.shapes.title.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        _run(p, title, size=Pt(36), color=theme.title_color, bold=True)
+        p.alignment = PP_ALIGN.CENTER
+
+    # Accent line under title
+    _thin_line(slide, 4.5, 2.7, 4.333, theme.accent_bar_color)
+
+    # Bottom decorative band
+    band = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        Inches(0), Inches(6.8), Inches(13.333), Inches(0.7),
+    )
+    band.fill.solid()
+    band.fill.fore_color.rgb = _hex(theme.primary_color)
+    band.line.fill.background()
+
+    # Subtitle
+    for ph in slide.placeholders:
+        if ph.placeholder_format.idx == 1:
+            tf2 = ph.text_frame
+            tf2.clear()
+            p2 = tf2.paragraphs[0]
+            _run(p2, subtitle, size=Pt(18), color="888888")
+            p2.alignment = PP_ALIGN.CENTER
+            break
+
+
+def _section(prs, info, theme):
+    """Section divider with accent lines above and below."""
+    slide = prs.slides.add_slide(prs.slide_layouts[2])
+
+    title = info.get("title", "")
+    text = info.get("quote", "")
+
+    # Accent line above
+    _thin_line(slide, 5.0, 2.8, 3.333, theme.accent_bar_color)
 
     # Title
-    tb = _tb(slide, 1.5, 2.85, 10.333, 1.6)
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("title", "")
-    p.alignment = PP_ALIGN.CENTER
-    _font(p, fonts["title"], F["h1"], "FFFFFF", bold=True)
+    display = title if title else text
+    if slide.shapes.title:
+        tf = slide.shapes.title.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        _run(p, display, size=Pt(32), color="333333", bold=True)
+        p.alignment = PP_ALIGN.CENTER
+
+    # Accent line below (only for section, not quote)
+    if title and not text:
+        _thin_line(slide, 5.0, 4.8, 3.333, theme.accent_bar_color)
+
+    # Attribution (for quote type)
+    attr = info.get("attribution", "")
+    if attr:
+        for ph in slide.placeholders:
+            if ph.placeholder_format.idx == 1:
+                tf2 = ph.text_frame
+                tf2.clear()
+                p2 = tf2.paragraphs[0]
+                _run(p2, f"— {attr}", size=Pt(14), color="999999", italic=True)
+                break
+
+
+def _content(prs, info, theme, depth="medium"):
+    """Content slide — title + styled body with bullet prefixes."""
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+
+    # === Title ===
+    title = info.get("title", "")
+    if slide.shapes.title:
+        tf = slide.shapes.title.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        _run(p, title, size=Pt(26), color=theme.title_color, bold=True)
+        # Thin rule under title
+        _thin_line(slide, 0.8, 1.05, 3.0, theme.accent_bar_color)
+
+    # === Body ===
+    body_ph = None
+    for ph in slide.placeholders:
+        if ph.placeholder_format.idx == 1:
+            body_ph = ph
+            break
+
+    if not body_ph:
+        return
+
+    tf = body_ph.text_frame
+    tf.clear()
+
+    lines = []  # (text, size, color, bold, italic)
 
     # Subtitle
     sub = info.get("subtitle", "")
     if sub:
-        tb2 = _tb(slide, 2.5, 4.65, 8.333, 0.7)
-        p2 = tb2.text_frame.paragraphs[0]
-        p2.text = sub
-        p2.alignment = PP_ALIGN.CENTER
-        _font(p2, fonts["body"], F["h1_sub"], "B0C4DE")
+        lines.append((sub, Pt(14), theme.secondary_color, False, True))
+        lines.append(("", Pt(6), "FFFFFF", False, False))  # spacer
 
-    # Bottom decorative line
-    _rect(slide, 4.5, 5.55, 4.333, 0.015, theme.accent_bar_color)
-
-
-def _content(prs, info, theme, fonts, deep=False):
-    """Content slide — accent bar, title with rule, bullets, optional highlight card."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    if theme.background_color not in ("FFFFFF", "FFFAF5", "FFF8F0"):
-        _rect(slide, 0, 0, 13.333, 7.5, theme.background_color)
-
-    # Top accent bar
-    _rect(slide, 0, 0, 13.333, G["accent_h"], theme.accent_bar_color)
-
-    # Title
-    tb = _tb(slide, G["left"], 0.35, G["content_w"], 0.65)
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("title", "")
-    _font(p, fonts["title"], F["h2"], theme.title_color, bold=True)
-
-    # Thin rule under title
-    _rect(slide, G["left"], 1.02, 3.0, 0.025, theme.accent_bar_color)
-
-    # Subtitle
-    sub = info.get("subtitle", "")
-    bullet_top_val = 1.25
-    if sub:
-        tb2 = _tb(slide, G["left"], 1.12, G["content_w"], 0.35)
-        p2 = tb2.text_frame.paragraphs[0]
-        p2.text = sub
-        _font(p2, fonts["body"], F["h3"], theme.secondary_color, italic=True)
-        bullet_top_val = 1.55
-
-    # Highlight — now as a bottom card instead of right-side box
-    highlight = info.get("highlight", "")
-    if highlight and deep:
-        _highlight_card(slide, highlight, theme, fonts)
-        bullet_h = 4.3
-    else:
-        bullet_h = 5.3
+    # Narrative (light slides)
+    narrative = info.get("narrative", "")
+    if narrative:
+        lines.append((narrative, Pt(20) if depth == "light" else Pt(16), theme.text_color, False, False))
+        lines.append(("", Pt(8), "FFFFFF", False, False))
 
     # Bullets
     bullets = info.get("bullets", [])
-    if bullets:
-        tb3 = _tb(slide, G["left"] + Inches(0.1), Inches(bullet_top_val), G["content_w"] - Inches(0.3), Inches(bullet_h))
-        tf = tb3.text_frame
-        tf.word_wrap = True
-        first = True
-        for item in bullets:
-            if isinstance(item, dict):
-                text = item.get("text", "")
-                subs = item.get("sub_bullets", [])
-            else:
-                text = str(item)
-                subs = []
+    for item in bullets:
+        if isinstance(item, dict):
+            main_text = item.get("text", "")
+            subs = item.get("sub_bullets", [])
+        else:
+            main_text = str(item)
+            subs = []
 
-            p = tf.paragraphs[0] if first else tf.add_paragraph()
-            p.text = text
-            p.level = 0
-            p.space_after = Pt(4)
-            p.space_before = Pt(4)
-            _font(p, fonts["body"], F["body"], theme.text_color)
-            _bullet(p, "•", theme.accent_bar_color)
-            first = False
+        if main_text:
+            lines.append((f"  {main_text}", Pt(16), theme.text_color, False, False))
+        for s_text in subs:
+            lines.append((f"     ─ {s_text}", Pt(13), theme.secondary_color, False, False))
 
-            for s_text in subs:
-                sp = tf.add_paragraph()
-                sp.text = str(s_text)
-                sp.level = 1
-                sp.space_after = Pt(2)
-                sp.space_before = Pt(2)
-                _font(sp, fonts["body"], F["body_sm"], theme.secondary_color)
-                _bullet(sp, "–", theme.secondary_color)
+    # Highlight
+    highlight = info.get("highlight", "")
+    if highlight:
+        lines.append(("", Pt(8), "FFFFFF", False, False))  # spacer
+        lines.append((f"☆  {highlight}", Pt(15), theme.accent_bar_color, True, False))
+
+    # Big number (datapoint)
+    big = info.get("big_number", "")
+    if big:
+        lines.insert(0, (big, Pt(56), theme.accent_bar_color, True, False))
+        desc = info.get("description", "")
+        if desc:
+            lines.insert(1, (desc, Pt(16), theme.text_color, False, False))
+
+    # Write to placeholder
+    for j, (text, size, color, bold, italic) in enumerate(lines):
+        p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+        if text.strip():  # non-empty
+            _run(p, text, size=size, color=color, bold=bold, italic=italic)
+        else:  # spacer
+            _run(p, "", size=Pt(4), color="FFFFFF")
+        p.space_after = Pt(2)
+        p.space_before = Pt(2)
 
 
-def _light(prs, info, theme, fonts):
-    """Light/breather slide — large text, lots of whitespace, minimal decoration."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    if theme.background_color not in ("FFFFFF", "FFFAF5", "FFF8F0"):
-        _rect(slide, 0, 0, 13.333, 7.5, theme.background_color)
+def _two_col(prs, info, theme):
+    """Two-column slide using built-in Two Content layout."""
+    slide = prs.slides.add_slide(prs.slide_layouts[3])
 
-    # Thin top bar
-    _rect(slide, 0, 0, 13.333, G["accent_h"], theme.accent_bar_color)
-
-    narrative = info.get("narrative", "")
-    bullets = info.get("bullets", [])
+    # Title
     title = info.get("title", "")
+    if slide.shapes.title:
+        tf = slide.shapes.title.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        _run(p, title, size=Pt(26), color=theme.title_color, bold=True)
+        _thin_line(slide, 0.8, 1.05, 3.0, theme.accent_bar_color)
 
-    y_start = Inches(1.6)
+    # Left column → idx 1
+    left = info.get("left_bullets", [])
+    for ph in slide.placeholders:
+        if ph.placeholder_format.idx == 1:
+            tf = ph.text_frame
+            tf.clear()
+            for j, item in enumerate(left):
+                text = item.get("text", "") if isinstance(item, dict) else str(item)
+                p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                _run(p, f"  {text}", size=Pt(15), color=theme.text_color)
+                p.space_after = Pt(6)
+            break
 
-    if narrative:
-        tb = _tb(slide, Inches(1.8), y_start, Inches(9.733), Inches(3.5))
+    # Right column → idx 2
+    right = info.get("right_bullets", [])
+    for ph in slide.placeholders:
+        if ph.placeholder_format.idx == 2:
+            tf = ph.text_frame
+            tf.clear()
+            for j, item in enumerate(right):
+                text = item.get("text", "") if isinstance(item, dict) else str(item)
+                p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                _run(p, f"  {text}", size=Pt(15), color=theme.text_color)
+                p.space_after = Pt(6)
+            break
+
+
+def _chart(prs, info, theme):
+    """Chart slide — blank layout + chart + styled insight panel."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    # Title
+    title = info.get("title", "")
+    if title:
+        tb = slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(11.5), Inches(0.6))
         tb.text_frame.word_wrap = True
         p = tb.text_frame.paragraphs[0]
-        p.text = narrative
-        p.alignment = PP_ALIGN.LEFT
-        _font(p, fonts["body"], F["light"], theme.text_color)
-    elif bullets:
-        tb = _tb(slide, Inches(1.8), y_start, Inches(9.733), Inches(4.0))
-        tb.text_frame.word_wrap = True
-        for i, item in enumerate(bullets):
-            text = item.get("text", "") if isinstance(item, dict) else str(item)
-            p = tb.text_frame.paragraphs[0] if i == 0 else tb.text_frame.add_paragraph()
-            p.text = text
-            p.space_after = Pt(14)
-            p.space_before = Pt(6)
-            _font(p, fonts["body"], F["light"], theme.text_color)
-            _bullet(p, "•", theme.accent_bar_color)
-
-    # Title at bottom as anchor
-    if title:
-        tb2 = _tb(slide, Inches(1.8), Inches(5.8), Inches(9.733), Inches(0.7))
-        p2 = tb2.text_frame.paragraphs[0]
-        p2.text = title
-        _font(p2, fonts["title"], F["h2"], theme.title_color, bold=True)
-
-
-def _chart(prs, info, theme, fonts):
-    """Chart slide — 60% chart + 35% insight panel, with title."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    if theme.background_color not in ("FFFFFF", "FFFAF5", "FFF8F0"):
-        _rect(slide, 0, 0, 13.333, 7.5, theme.background_color)
-
-    _rect(slide, 0, 0, 13.333, G["accent_h"], theme.accent_bar_color)
-
-    # Title + rule
-    tb = _tb(slide, G["left"], 0.35, G["content_w"], 0.6)
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("title", "")
-    _font(p, fonts["title"], F["h2"], theme.title_color, bold=True)
-    _rect(slide, G["left"], 0.98, 3.0, 0.025, theme.accent_bar_color)
+        _run(p, title, size=Pt(26), color=theme.title_color, bold=True)
+        _thin_line(slide, 0.8, 0.95, 3.0, theme.accent_bar_color)
 
     # Subtitle
     sub = info.get("subtitle", "")
-    chart_y = Inches(1.2) if sub else Inches(1.15)
+    chart_y = Inches(1.3) if sub else Inches(1.1)
     if sub:
-        tb2 = _tb(slide, G["left"], 1.1, G["content_w"], 0.3)
+        tb2 = slide.shapes.add_textbox(Inches(0.8), Inches(0.95), Inches(11.5), Inches(0.3))
+        tb2.text_frame.word_wrap = True
         p2 = tb2.text_frame.paragraphs[0]
-        p2.text = sub
-        _font(p2, fonts["body"], F["h3"], theme.secondary_color, italic=True)
-        chart_y = Inches(1.5)
+        _run(p2, sub, size=Pt(14), color=theme.secondary_color, italic=True)
 
-    # Chart
-    chart_h = Inches(5.2)
+    # Build chart
     ct_str = info.get("chart_type", "column")
-    xl_type = _CHART_MAP.get(ct_str, XL_CHART_TYPE.COLUMN_CLUSTERED)
+    chart_types = {
+        "bar": XL_CHART_TYPE.BAR_CLUSTERED,
+        "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+        "line": XL_CHART_TYPE.LINE_MARKERS,
+        "pie": XL_CHART_TYPE.PIE,
+        "stacked_bar": XL_CHART_TYPE.BAR_STACKED,
+        "area": XL_CHART_TYPE.AREA,
+    }
+    xl_type = chart_types.get(ct_str, XL_CHART_TYPE.COLUMN_CLUSTERED)
+
     cats = info.get("categories", [])
     series_list = info.get("series", [])
-    colors = _chart_colors(theme)
-
     cd = CategoryChartData()
     cd.categories = cats
-    for idx, s in enumerate(series_list):
-        cd.add_series(s.get("name", f"S{idx+1}"), s.get("values", []))
+    for s in series_list:
+        cd.add_series(s.get("name", "Series"), s.get("values", []))
 
-    chart_frame = slide.shapes.add_chart(xl_type, G["left"], chart_y, CHART_W, chart_h, cd)
-    _style_chart(chart_frame.chart, theme, colors, ct_str)
-
-    # Insight panel
-    insight = info.get("insight", "")
-    if insight:
-        # Subtle background card
-        card = slide.shapes.add_shape(
-            MSO_SHAPE.ROUNDED_RECTANGLE,
-            INSIGHT_X, Inches(2.4), INSIGHT_W, Inches(3.8),
-        )
-        card.fill.solid()
-        card.fill.fore_color.rgb = _hex(theme.primary_color)
-        card.line.fill.background()
-
-        # Label
-        lb = _tb(slide, INSIGHT_X + Inches(0.35), Inches(2.6), INSIGHT_W - Inches(0.7), Inches(0.3))
-        pl = lb.text_frame.paragraphs[0]
-        pl.text = "KEY INSIGHT"
-        _font(pl, fonts["body"], Pt(9), "B0C4DE", bold=True)
-
-        # Insight text
-        ib = _tb(slide, INSIGHT_X + Inches(0.35), Inches(3.0), INSIGHT_W - Inches(0.7), Inches(3.0))
-        ib.text_frame.word_wrap = True
-        pi = ib.text_frame.paragraphs[0]
-        pi.text = insight
-        _font(pi, fonts["body"], F["body_sm"], "FFFFFF")
-
-
-def _two_col(prs, info, theme, fonts):
-    """Two-column comparison — equal halves with center divider."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    if theme.background_color not in ("FFFFFF", "FFFAF5", "FFF8F0"):
-        _rect(slide, 0, 0, 13.333, 7.5, theme.background_color)
-
-    _rect(slide, 0, 0, 13.333, G["accent_h"], theme.accent_bar_color)
-
-    # Title
-    tb = _tb(slide, G["left"], 0.35, G["content_w"], 0.6)
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("title", "")
-    _font(p, fonts["title"], F["h2"], theme.title_color, bold=True)
-    _rect(slide, G["left"], 0.98, 3.0, 0.025, theme.accent_bar_color)
-
-    col_y = Inches(1.25)
-    half_w = Inches(5.5)
-    gap_c = Inches(6.65)
-
-    # Left column
-    left_items = info.get("left_bullets", [])
-    if left_items:
-        lb = _tb(slide, G["left"], col_y, half_w, Inches(5.2))
-        _fill_col(lb, left_items, fonts, theme)
-
-    # Center divider
-    _rect(slide, gap_c, Inches(1.3), Inches(0.015), Inches(5.0), theme.accent_bar_color)
-
-    # Right column
-    right_items = info.get("right_bullets", [])
-    if right_items:
-        rb = _tb(slide, Inches(6.9), col_y, half_w, Inches(5.2))
-        _fill_col(rb, right_items, fonts, theme)
-
-
-def _quote(prs, info, theme, fonts):
-    """Quote slide — large watermark quote mark, elegant text, attribution."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-
-    _rect(slide, 0, 0, 13.333, 7.5, theme.primary_color)
-
-    # Large watermark quote mark
-    qb = _tb(slide, Inches(1.0), Inches(-0.5), Inches(3.0), Inches(3.0))
-    pq = qb.text_frame.paragraphs[0]
-    pq.text = "“"
-    _font(pq, fonts["title"], Pt(120), "FFFFFF", bold=True)
-    # Make semi-transparent (approximate with lighter color)
-    pq.runs[0].font.color.rgb = _hex("FFFFFF")
-
-    # Top & bottom decorative lines
-    _rect(slide, Inches(2.0), Inches(1.7), Inches(9.333), Inches(0.01), theme.accent_bar_color)
-
-    # Quote text
-    tb = _tb(slide, Inches(2.0), Inches(2.0), Inches(9.333), Inches(3.2))
-    tb.text_frame.word_wrap = True
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("quote", "")
-    p.alignment = PP_ALIGN.LEFT
-    _font(p, fonts["title"], F["quote"], "FFFFFF", italic=True)
-
-    # Attribution
-    attr = info.get("attribution", "")
-    if attr:
-        _rect(slide, Inches(2.0), Inches(5.35), Inches(9.333), Inches(0.01), theme.accent_bar_color)
-        ab = _tb(slide, Inches(2.0), Inches(5.55), Inches(9.333), Inches(0.5))
-        pa = ab.text_frame.paragraphs[0]
-        pa.text = f"— {attr}"
-        pa.alignment = PP_ALIGN.RIGHT
-        _font(pa, fonts["body"], F["body_sm"], "B0C4DE")
-
-
-def _datapoint(prs, info, theme, fonts):
-    """Big number/metric slide — striking number on left, context on right."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    if theme.background_color not in ("FFFFFF", "FFFAF5", "FFF8F0"):
-        _rect(slide, 0, 0, 13.333, 7.5, theme.background_color)
-
-    _rect(slide, 0, 0, 13.333, G["accent_h"], theme.accent_bar_color)
-
-    # Big number
-    big = info.get("big_number", "")
-    if big:
-        nb = _tb(slide, G["left"], Inches(1.0), Inches(5.5), Inches(2.2))
-        pn = nb.text_frame.paragraphs[0]
-        pn.text = big
-        _font(pn, fonts["title"], F["big_num"], theme.accent_bar_color, bold=True)
-
-    # Title
-    title = info.get("title", "")
-    if title:
-        tb = _tb(slide, G["left"], Inches(3.2), Inches(5.5), Inches(0.7))
-        pt = tb.text_frame.paragraphs[0]
-        pt.text = title
-        _font(pt, fonts["title"], F["h2"], theme.title_color, bold=True)
-
-    # Description
-    desc = info.get("description", "")
-    if desc:
-        db = _tb(slide, G["left"], Inches(3.95), Inches(5.8), Inches(2.2))
-        db.text_frame.word_wrap = True
-        pd = db.text_frame.paragraphs[0]
-        pd.text = desc
-        _font(pd, fonts["body"], F["body"], theme.text_color)
-
-    # Right color block + context
-    ctx = info.get("context", "")
-    block = slide.shapes.add_shape(
-        MSO_SHAPE.ROUNDED_RECTANGLE,
-        Inches(8.0), Inches(1.2), Inches(4.8), Inches(5.2),
+    chart_frame = slide.shapes.add_chart(
+        xl_type, Inches(0.6), chart_y, Inches(7.8), Inches(5.2), cd,
     )
-    block.fill.solid()
-    block.fill.fore_color.rgb = _hex(theme.primary_color)
-    block.line.fill.background()
+    chart = chart_frame.chart
 
-    if ctx:
-        cb = _tb(slide, Inches(8.4), Inches(1.5), Inches(4.0), Inches(4.6))
-        cb.text_frame.word_wrap = True
-        pc = cb.text_frame.paragraphs[0]
-        pc.text = ctx
-        _font(pc, fonts["body"], F["body_sm"], "FFFFFF")
-
-
-def _agenda(prs, info, theme, fonts):
-    """Agenda/overview — numbered items with clean spacing."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-    if theme.background_color not in ("FFFFFF", "FFFAF5", "FFF8F0"):
-        _rect(slide, 0, 0, 13.333, 7.5, theme.background_color)
-
-    _rect(slide, 0, 0, 13.333, G["accent_h"], theme.accent_bar_color)
-
-    # Title
-    tb = _tb(slide, G["left"], 0.35, G["content_w"], 0.6)
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("title", "Agenda")
-    _font(p, fonts["title"], F["h2"], theme.title_color, bold=True)
-    _rect(slide, G["left"], 0.98, 3.0, 0.025, theme.accent_bar_color)
-
-    bullets = info.get("bullets", [])
-    if not bullets:
-        return
-
-    ab = _tb(slide, G["left"] + Inches(0.2), Inches(1.4), Inches(10.5), Inches(5.0))
-    ab.text_frame.word_wrap = True
-
-    for i, item in enumerate(bullets):
-        text = item.get("text", "") if isinstance(item, dict) else str(item)
-        p = ab.text_frame.paragraphs[0] if i == 0 else ab.text_frame.add_paragraph()
-
-        # Number badge
-        num = f"{i + 1:02d}"
-        p.text = f"{num}    {text}"
-        p.space_after = Pt(14)
-        p.space_before = Pt(6)
-        _font(p, fonts["body"], F["body"], theme.text_color)
-        # Color the number
-        if p.runs:
-            p.runs[0].font.color.rgb = _hex(theme.accent_bar_color)
-            p.runs[0].font.bold = True
-
-
-def _section(prs, info, theme, fonts):
-    """Section divider — full color background, large title, elegant lines."""
-    slide_layout = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(slide_layout)
-
-    _rect(slide, 0, 0, 13.333, 7.5, theme.primary_color)
-
-    # Top line
-    _rect(slide, 5.0, 3.0, 3.333, 0.012, theme.accent_bar_color)
-
-    # Title
-    tb = _tb(slide, 2.0, 3.2, 9.333, 1.8)
-    tb.text_frame.word_wrap = True
-    p = tb.text_frame.paragraphs[0]
-    p.text = info.get("title", "")
-    p.alignment = PP_ALIGN.CENTER
-    _font(p, fonts["title"], Pt(36), "FFFFFF", bold=True)
-
-    # Bottom line
-    _rect(slide, 5.0, 5.2, 3.333, 0.012, theme.accent_bar_color)
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def _highlight_card(slide, text, theme, fonts):
-    """A subtle highlight card at the bottom of deep content slides."""
-    card = slide.shapes.add_shape(
-        MSO_SHAPE.ROUNDED_RECTANGLE,
-        G["left"], Inches(5.8), G["content_w"], Inches(0.9),
-    )
-    card.fill.solid()
-    card.fill.fore_color.rgb = _hex(theme.accent_bar_color)
-    card.line.fill.background()
-
-    hb = _tb(slide, G["left"] + Inches(0.3), Inches(5.9), G["content_w"] - Inches(0.6), Inches(0.7))
-    hb.text_frame.word_wrap = True
-    ph = hb.text_frame.paragraphs[0]
-    ph.text = f"☆  {text}"  # ☆
-    _font(ph, fonts["body"], F["body_sm"], theme.title_color, bold=True)
-
-
-def _page_num(slide, num, theme):
-    """Slide number at consistent bottom-right position."""
-    nb = _tb(slide, G["num_x"], G["num_y"], Inches(0.8), Inches(0.25))
-    p = nb.text_frame.paragraphs[0]
-    p.text = str(num)
-    p.alignment = PP_ALIGN.RIGHT
-    _font(p, "Calibri", F["caption"], theme.secondary_color)
-
-
-def _bottom_bar(slide, theme):
-    """Subtle bottom decorative line."""
-    _rect(slide, G["left"], G["bottom"], G["content_w"], G["bottom_bar_h"], theme.accent_bar_color)
-
-
-def _notes(slide, info):
-    """Speaker notes — with safe fallback."""
-    txt = info.get("notes", "")
-    if not txt:
-        return
-    try:
-        if slide.has_notes_slide:
-            slide.notes_slide.notes_text_frame.text = txt
-    except Exception:
-        pass  # Notes slide creation can fail in some edge cases
-
-
-# ============================================================================
-# CHART SUPPORT
-# ============================================================================
-
-_CHART_MAP = {
-    "bar": XL_CHART_TYPE.BAR_CLUSTERED,
-    "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
-    "line": XL_CHART_TYPE.LINE_MARKERS,
-    "pie": XL_CHART_TYPE.PIE,
-    "stacked_bar": XL_CHART_TYPE.BAR_STACKED,
-    "area": XL_CHART_TYPE.AREA,
-}
-
-
-def _chart_colors(theme):
-    return [_hex(theme.accent_bar_color), _hex(theme.primary_color),
-            _hex(theme.secondary_color), _hex(theme.title_color)]
-
-
-def _style_chart(chart, theme, colors, ct_str):
+    # Chart styling
     chart.chart_style = 3
-
-    for idx, series in enumerate(chart.series):
-        color = colors[idx % len(colors)]
-        series.format.fill.solid()
-        series.format.fill.fore_color.rgb = color
-        if ct_str in ("line", "area"):
-            series.format.line.color.rgb = color
-            series.format.line.width = Pt(2.5)
-        if ct_str in ("bar", "column", "stacked_bar"):
-            try:
-                chart.plots[0].gap_width = 80
-            except Exception:
-                pass
+    if ct_str in ("bar", "column", "stacked_bar"):
+        try:
+            chart.plots[0].gap_width = 80  # thicker bars
+        except Exception:
+            pass
 
     # Data labels
     if ct_str in ("bar", "column", "stacked_bar", "pie"):
@@ -598,23 +372,26 @@ def _style_chart(chart, theme, colors, ct_str):
             plot = chart.plots[0]
             plot.has_data_labels = True
             plot.data_labels.font.size = Pt(8)
-            plot.data_labels.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
         except Exception:
             pass
 
-    # Pie borders
-    if ct_str == "pie":
-        for idx, series in enumerate(chart.series):
-            try:
-                for pi in range(len(series.values)):
-                    series.points(pi).format.line.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                    series.points(pi).format.line.width = Pt(1.5)
-            except Exception:
-                pass
+    # Series colors
+    accent_colors = [theme.accent_bar_color, theme.primary_color,
+                     theme.secondary_color, theme.title_color]
+    for idx, series in enumerate(chart.series):
+        color = accent_colors[idx % len(accent_colors)]
+        series.format.fill.solid()
+        series.format.fill.fore_color.rgb = _hex(color)
 
-    # Legend
+    # Line styling
+    if ct_str in ("line", "area"):
+        for idx, series in enumerate(chart.series):
+            color = accent_colors[idx % len(accent_colors)]
+            series.format.line.color.rgb = _hex(color)
+            series.format.line.width = Pt(2.5)
+
+    # Legend at bottom
     if chart.has_legend:
-        chart.legend.include_in_layout = False
         chart.legend.font.size = Pt(9)
         try:
             from pptx.enum.chart import XL_LEGEND_POSITION
@@ -622,79 +399,327 @@ def _style_chart(chart, theme, colors, ct_str):
         except ImportError:
             pass
 
-    # Axes
+    # Axis labels
     if ct_str != "pie":
         if chart.category_axis:
             chart.category_axis.tick_labels.font.size = Pt(8)
-            chart.category_axis.tick_labels.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
         if chart.value_axis:
             chart.value_axis.tick_labels.font.size = Pt(8)
-            chart.value_axis.tick_labels.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
+    # Insight box
+    insight = info.get("insight", "")
+    if insight:
+        # Subtle background card
+        card = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(8.7), Inches(2.3), Inches(4.0), Inches(3.5),
+        )
+        card.fill.solid()
+        card.fill.fore_color.rgb = _hex(theme.primary_color)
+        card.line.fill.background()
 
-def _fill_col(box, items, fonts, theme):
-    tf = box.text_frame
-    tf.word_wrap = True
-    for i, item in enumerate(items):
-        text = item.get("text", "") if isinstance(item, dict) else str(item)
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = text
-        p.space_after = Pt(6)
-        p.space_before = Pt(3)
-        _font(p, fonts["body"], F["body"], theme.text_color)
-        _bullet(p, "•", theme.accent_bar_color)
+        # Label
+        lb = slide.shapes.add_textbox(Inches(8.95), Inches(2.5), Inches(3.5), Inches(0.3))
+        plb = lb.text_frame.paragraphs[0]
+        _run(plb, "KEY INSIGHT", size=Pt(8), color="B0C4DE", bold=True)
+
+        # Insight text
+        ib = slide.shapes.add_textbox(Inches(8.95), Inches(2.85), Inches(3.5), Inches(2.7))
+        ib.text_frame.word_wrap = True
+        pib = ib.text_frame.paragraphs[0]
+        _run(pib, insight, size=Pt(13), color="FFFFFF")
 
 
 # ============================================================================
-# ATOMIC HELPERS
+# NEW SLIDE TYPES — visual upgrades
 # ============================================================================
 
-def _rect(slide, x, y, w, h, color):
-    """Add a filled rectangle (no border). Accepts hex string or RGBColor."""
-    s = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
-    s.fill.solid()
-    s.fill.fore_color.rgb = color if isinstance(color, RGBColor) else _hex(color)
-    s.line.fill.background()
-    return s
+def _image_slide(prs, info, theme):
+    """Full-bleed image background with bold text overlay. Falls back to color bg."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    # Try to download a background image
+    desc = info.get("image_description", info.get("title", "abstract"))
+    img_buf = get_picsum_bg(desc, blur=0)
+
+    if img_buf:
+        # Add image as full-slide background
+        slide.shapes.add_picture(img_buf, Inches(0), Inches(0),
+                                 Inches(13.333), Inches(7.5))
+        # Dark overlay for text readability
+        overlay = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5),
+        )
+        overlay.fill.solid()
+        overlay.fill.fore_color.rgb = RGBColor(0, 0, 0)
+        overlay.line.fill.background()
+        # Set transparency via alpha
+        try:
+            from pptx.oxml.ns import qn
+            sf = overlay.fill._fill
+            srgb = sf.find(qn('a:solidFill')).find(qn('a:srgbClr'))
+            if srgb is not None:
+                a = srgb.makeelement(qn('a:alpha'), {'val': '40000'})
+                srgb.append(a)
+        except Exception:
+            pass  # transparency is optional
+        text_color = "FFFFFF"
+    else:
+        # Fallback: solid color background
+        rect = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5),
+        )
+        rect.fill.solid()
+        rect.fill.fore_color.rgb = _hex(theme.primary_color)
+        rect.line.fill.background()
+        text_color = "FFFFFF"
+
+    # Big statement text
+    content = info.get("narrative") or info.get("title", "")
+    tb = slide.shapes.add_textbox(Inches(1.5), Inches(2.5), Inches(10.333), Inches(2.5))
+    tb.text_frame.word_wrap = True
+    p = tb.text_frame.paragraphs[0]
+    _run(p, content, size=Pt(32), color=text_color, bold=True)
+    p.alignment = PP_ALIGN.CENTER
+
+    # Subtitle
+    sub = info.get("subtitle", "")
+    if sub:
+        tb2 = slide.shapes.add_textbox(Inches(2.0), Inches(5.0), Inches(9.333), Inches(0.8))
+        tb2.text_frame.word_wrap = True
+        p2 = tb2.text_frame.paragraphs[0]
+        _run(p2, sub, size=Pt(16), color="B0C4DE" if img_buf else "D0D0D0")
+        p2.alignment = PP_ALIGN.CENTER
 
 
-def _tb(slide, x, y, w, h):
-    """Add a text box."""
-    return slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+def _timeline(prs, info, theme):
+    """Horizontal timeline with milestone nodes."""
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+
+    title = info.get("title", "Timeline")
+    if slide.shapes.title:
+        tf = slide.shapes.title.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        _run(p, title, size=Pt(26), color=theme.title_color, bold=True)
+        _thin_line(slide, 0.8, 1.05, 3.0, theme.accent_bar_color)
+
+    milestones = info.get("milestones", [])
+    if not milestones:
+        return
+
+    n = len(milestones)
+    line_y = Inches(3.6)
+    start_x = Inches(0.8)
+    end_x = Inches(12.5)
+    total_w = 11.7  # inches of usable space
+
+    # Horizontal line
+    _thin_line(slide, 0.8, 3.6, total_w, theme.accent_bar_color)
+
+    for idx, m in enumerate(milestones):
+        x = start_x + Emu(int(Emu(Inches(total_w)) * idx / max(n - 1, 1)))
+
+        # Node circle
+        node = slide.shapes.add_shape(
+            MSO_SHAPE.OVAL,
+            x - Inches(0.12), line_y - Inches(0.12), Inches(0.24), Inches(0.24),
+        )
+        node.fill.solid()
+        node.fill.fore_color.rgb = _hex(theme.accent_bar_color)
+        node.line.fill.background()
+
+        # Year label
+        year = m.get("year", "") if isinstance(m, dict) else str(m)
+        event = m.get("title", "") if isinstance(m, dict) else ""
+        brief = m.get("brief", "") if isinstance(m, dict) else ""
+
+        if year:
+            ty = slide.shapes.add_textbox(x - Inches(0.6), line_y - Inches(0.6), Inches(1.2), Inches(0.35))
+            tp = ty.text_frame.paragraphs[0]
+            _run(tp, str(year), size=Pt(12), color=theme.accent_bar_color, bold=True)
+            tp.alignment = PP_ALIGN.CENTER
+
+        # Event text
+        if event:
+            te = slide.shapes.add_textbox(x - Inches(0.8), line_y + Inches(0.3), Inches(1.6), Inches(1.5))
+            te.text_frame.word_wrap = True
+            ep = te.text_frame.paragraphs[0]
+            _run(ep, event, size=Pt(11), color=theme.text_color, bold=True)
+            if brief:
+                ep2 = te.text_frame.add_paragraph()
+                _run(ep2, brief, size=Pt(9), color=theme.secondary_color)
 
 
-def _font(paragraph, font_name, size, color_hex, bold=False, italic=False):
-    """Set font properties. Tries to set font name; falls back silently if unavailable."""
-    if not paragraph.runs:
-        paragraph.add_run()
-    r = paragraph.runs[0]
-    try:
-        r.font.name = font_name
-    except Exception:
-        pass
-    r.font.size = size
-    r.font.color.rgb = _hex(color_hex)
-    r.font.bold = bold
-    r.font.italic = italic
+def _comparison(prs, info, theme):
+    """Side-by-side comparison with VS divider."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    title = info.get("title", "Comparison")
+    tb = slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(11.5), Inches(0.6))
+    p = tb.text_frame.paragraphs[0]
+    _run(p, title, size=Pt(26), color=theme.title_color, bold=True)
+    _thin_line(slide, 0.8, 0.95, 3.0, theme.accent_bar_color)
+
+    left_data = info.get("left", {})
+    right_data = info.get("right", {})
+    vs_label = info.get("vs_label", "VS")
+
+    # Left panel
+    _comp_panel(slide, Inches(0.5), Inches(1.3), Inches(5.2),
+                left_data.get("label", "Option A"),
+                left_data.get("points", []), theme,
+                left_data.get("icon", "A"))
+
+    # Right panel
+    _comp_panel(slide, Inches(7.6), Inches(1.3), Inches(5.2),
+                right_data.get("label", "Option B"),
+                right_data.get("points", []), theme,
+                right_data.get("icon", "B"))
+
+    # VS badge in the center
+    badge = slide.shapes.add_shape(
+        MSO_SHAPE.OVAL, Inches(6.15), Inches(3.3), Inches(1.0), Inches(1.0),
+    )
+    badge.fill.solid()
+    badge.fill.fore_color.rgb = _hex(theme.accent_bar_color)
+    badge.line.fill.background()
+    # VS text
+    vstb = slide.shapes.add_textbox(Inches(6.15), Inches(3.5), Inches(1.0), Inches(0.6))
+    vsp = vstb.text_frame.paragraphs[0]
+    _run(vsp, vs_label, size=Pt(18), color="FFFFFF", bold=True)
+    vsp.alignment = PP_ALIGN.CENTER
 
 
-def _bullet(paragraph, char, color_hex):
-    """Add a bullet character to a paragraph. Safe XML manipulation."""
-    pPr = paragraph._p.get_or_add_pPr()
-    # Remove only bullet-related children
-    to_remove = []
-    for child in pPr:
-        if child.tag in [qn("a:buChar"), qn("a:buNone"), qn("a:buAutoNum")]:
-            to_remove.append(child)
-    for child in to_remove:
-        pPr.remove(child)
-    # Add new bullet character
-    buChar = pPr.makeelement(qn("a:buChar"), {"char": char})
-    pPr.append(buChar)
+def _comp_panel(slide, x, y, w, label, points, theme, icon):
+    """Helper: draw one comparison panel."""
+    # Background card
+    card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, Inches(5.2))
+    card.fill.solid()
+    card.fill.fore_color.rgb = _hex("F5F7FA" if theme.background_color == "FFFFFF" else theme.background_color)
+    card.line.color.rgb = _hex(theme.secondary_color)
+    card.line.width = Pt(0.5)
+
+    # Label
+    lb = slide.shapes.add_textbox(x + Inches(0.3), y + Inches(0.2), w - Inches(0.6), Inches(0.4))
+    lp = lb.text_frame.paragraphs[0]
+    _run(lp, f"{icon}  {label}", size=Pt(16), color=theme.title_color, bold=True)
+
+    # Points
+    pb = slide.shapes.add_textbox(x + Inches(0.3), y + Inches(0.8), w - Inches(0.6), Inches(4.0))
+    pb.text_frame.word_wrap = True
+    for j, pt in enumerate(points):
+        text = pt.get("text", "") if isinstance(pt, dict) else str(pt)
+        pp = pb.text_frame.paragraphs[0] if j == 0 else pb.text_frame.add_paragraph()
+        _run(pp, f"  {text}", size=Pt(13), color=theme.text_color)
+        pp.space_after = Pt(8)
+        pp.space_before = Pt(4)
 
 
-def _hex(h: str) -> RGBColor:
-    h = h.lstrip("#")
-    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+def _big_idea(prs, info, theme):
+    """One massive statement — like a billboard. Minimal design, maximum impact."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    # Full color background
+    bg = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5),
+    )
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = _hex(theme.primary_color)
+    bg.line.fill.background()
+
+    # Decorative top line
+    _thin_line(slide, 5.0, 2.4, 3.333, theme.accent_bar_color)
+
+    # Big text
+    big_text = info.get("big_text", info.get("title", ""))
+    tb = slide.shapes.add_textbox(Inches(1.5), Inches(2.7), Inches(10.333), Inches(2.2))
+    tb.text_frame.word_wrap = True
+    p = tb.text_frame.paragraphs[0]
+    _run(p, big_text, size=Pt(38), color="FFFFFF", bold=True)
+    p.alignment = PP_ALIGN.CENTER
+
+    # Sub text
+    sub = info.get("sub_text", info.get("subtitle", ""))
+    if sub:
+        _thin_line(slide, 5.0, 5.1, 3.333, theme.accent_bar_color)
+        tb2 = slide.shapes.add_textbox(Inches(2.0), Inches(5.3), Inches(9.333), Inches(0.8))
+        tb2.text_frame.word_wrap = True
+        p2 = tb2.text_frame.paragraphs[0]
+        _run(p2, sub, size=Pt(18), color="B0C4DE")
+        p2.alignment = PP_ALIGN.CENTER
 
 
+# ============================================================================
+# DECORATIONS — safe thin shapes only
+# ============================================================================
+
+def _top_bar(slide, theme):
+    """Thin colored bar across the top of the slide."""
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        Inches(0), Inches(0), Inches(13.333), Inches(0.04),
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _hex(theme.accent_bar_color)
+    shape.line.fill.background()
+
+
+def _bottom_bar(slide, theme):
+    """Subtle line at the bottom of content area."""
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        Inches(0.8), Inches(7.15), Inches(11.6), Inches(0.015),
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _hex(theme.secondary_color)
+    shape.line.fill.background()
+
+
+def _slide_num(slide, num, theme):
+    """Slide number at bottom-right corner."""
+    tb = slide.shapes.add_textbox(Inches(12.0), Inches(7.1), Inches(1.0), Inches(0.25))
+    p = tb.text_frame.paragraphs[0]
+    _run(p, str(num), size=Pt(8), color=theme.secondary_color)
+    p.alignment = PP_ALIGN.RIGHT
+
+
+def _left_stripe(slide, theme):
+    """Left-side vertical accent stripe for section slides."""
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        Inches(0), Inches(0), Inches(0.06), Inches(7.5),
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _hex(theme.accent_bar_color)
+    shape.line.fill.background()
+
+
+def _slide_progress(slide, current, total, theme):
+    """Tiny progress dots at the very bottom edge."""
+    dot_size = Inches(0.04)
+    gap = Inches(0.08)
+    total_w = total * (dot_size + gap) - gap
+    start_x = Inches((13.333 - Inches(total_w).inches) / 2)
+    dot_y = Inches(7.35)
+
+    for idx in range(total):
+        x = start_x + idx * (dot_size + gap)
+        dot = slide.shapes.add_shape(MSO_SHAPE.OVAL, x, dot_y, dot_size, dot_size)
+        dot.fill.solid()
+        if idx == current:
+            dot.fill.fore_color.rgb = _hex(theme.accent_bar_color)
+        else:
+            dot.fill.fore_color.rgb = _hex("CCCCCC")
+        dot.line.fill.background()
+
+
+def _notes(slide, info):
+    """Add speaker notes safely."""
+    text = info.get("notes", "")
+    if text:
+        try:
+            if slide.has_notes_slide:
+                slide.notes_slide.notes_text_frame.text = text
+        except Exception:
+            pass
